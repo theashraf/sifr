@@ -10,6 +10,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+typedef enum { FILL_RULE_NON_ZERO, FILL_RULE_EVEN_ODD } FILL_RULE;
 typedef struct {
     float x, y;
 } point_t;
@@ -78,7 +79,9 @@ int path_line_to(path_t* p, float x, float y) {
 }
 int path_close(path_t* p) {
     if (!p || arrlen(p->points) == 0) return 1;
-    arrpush(p->points, p->points[0]);
+    int start = (int)arrlen(p->commands) - 1;
+    while (start > 0 && p->commands[start] != PATH_CMD_MOVE_TO) --start;
+    arrpush(p->points, p->points[start]);
     arrpush(p->commands, PATH_CMD_CLOSE);
     return 0;
 }
@@ -90,16 +93,20 @@ void path_free(path_t* p) {
 float lerp(float a, float b, float t) { return a + (b - a) * t; }
 float inverse_lerp(float a, float b, float c) { return (c - a) / (b - a); }
 
-int compare_floats(const void* a, const void* b) {
-    float arg1 = *(const float*)a;
-    float arg2 = *(const float*)b;
+typedef struct {
+    float x;
+    int dir;
+} crossing_t;
+int compare_crossings(const void* a, const void* b) {
+    crossing_t arg1 = *(const crossing_t*)a;
+    crossing_t arg2 = *(const crossing_t*)b;
 
-    if (arg1 < arg2) return -1;
-    if (arg1 > arg2) return 1;
+    if (arg1.x < arg2.x) return -1;
+    if (arg1.x > arg2.x) return 1;
     return 0;
 }
 
-void fill_path(frame_t* frame, path_t* p, color_t color) {
+void fill_path(frame_t* frame, path_t* p, color_t color, FILL_RULE rule) {
     if (!frame || !p || arrlen(p->points) < 3) return;
     float y_min = INFINITY;
     float y_max = -INFINITY;
@@ -107,22 +114,28 @@ void fill_path(frame_t* frame, path_t* p, color_t color) {
         y_min = fminf(y_min, p->points[i].y);
         y_max = fmaxf(y_max, p->points[i].y);
     }
-    float* xs = NULL;
-    for (float y = floorf(y_min) + 0.5f; y < y_max; y++) {
+    crossing_t* xs = NULL;
+    for (float y = floorf(y_min); y < y_max; y++) {
         arrsetlen(xs, 0);
         for (int i = 1; i < arrlen(p->points); ++i) {
             point_t point0 = p->points[i - 1];
             point_t point1 = p->points[i];
+            if (p->commands[i] == PATH_CMD_MOVE_TO) continue;
             if (point0.y == point1.y) continue;
             if (y < fminf(point0.y, point1.y) || y >= fmaxf(point0.y, point1.y)) continue;
             float t = inverse_lerp(point0.y, point1.y, y);
-            arrpush(xs, lerp(point0.x, point1.x, t));
+            crossing_t crossing = {.x = lerp(point0.x, point1.x, t), .dir = point0.y > point1.y ? 1 : -1};
+            arrpush(xs, crossing);
         }
-        qsort(xs, arrlen(xs), sizeof(float), compare_floats);
-        for (int i = 0; i + 1 < arrlen(xs); i += 2) {
-            int x0 = (int)ceilf(xs[i] - 0.5f);
-            int x1 = (int)floorf(xs[i + 1] - 0.5f);
-            frame_draw_line(frame, x0, y, x1, y, color);
+        qsort(xs, arrlen(xs), sizeof(crossing_t), compare_crossings);
+        int winding = 0;
+        for (int i = 0; i + 1 < arrlen(xs); ++i) {
+            winding += xs[i].dir;
+            int inside = rule == FILL_RULE_NON_ZERO ? winding != 0 : (i & 1) == 0;
+            if (!inside) continue;
+            int x0 = (int)ceilf(xs[i].x);
+            int x1 = (int)floorf(xs[i + 1].x);
+            if (x1 >= x0) frame_draw_line(frame, x0, y, x1, y, color);
         }
     }
     arrfree(xs);
@@ -139,26 +152,28 @@ int main() {
     };
     frame_clear(&frame, (color_t){1, 1, 1, 1});
 
-    path_t p = {0};
-    path_move_to(&p, 50, 10);
-    path_line_to(&p, 90, 40);
-    path_line_to(&p, 75, 90);
-    path_line_to(&p, 25, 90);
-    path_close(&p);
+    FILL_RULE rules[2] = {FILL_RULE_NON_ZERO, FILL_RULE_EVEN_ODD};
+    color_t colors[2] = {{0.1f, 0.3f, 0.9f, 1}, {0.9f, 0.2f, 0.2f, 1}};
+    for (int i = 0; i < 2; ++i) {
+        float cx = 25 + i * 50;
 
-    fill_path(&frame, &p, (color_t){0, 0, 0.5, 1});
-
-    path_t q = {0};
-    path_move_to(&q, 60, 50);
-    path_line_to(&q, 110, 60);
-    path_line_to(&q, 80, 110);
-    path_close(&q);
-    fill_path(&frame, &q, (color_t){0, 1, 0, 0.5});
+        path_t sq = {0};
+        path_move_to(&sq, cx - 20, 30);
+        path_line_to(&sq, cx + 20, 30);
+        path_line_to(&sq, cx + 20, 70);
+        path_line_to(&sq, cx - 20, 70);
+        path_close(&sq);
+        path_move_to(&sq, cx - 10, 40);
+        path_line_to(&sq, cx + 10, 40);
+        path_line_to(&sq, cx + 10, 60);
+        path_line_to(&sq, cx - 10, 60);
+        path_close(&sq);
+        fill_path(&frame, &sq, colors[i], rules[i]);
+        path_free(&sq);
+    }
 
     frame_to_png(&frame, "out.png");
 
-    path_free(&q);
-    path_free(&p);
     free(frame.buffer);
     return 0;
 }
